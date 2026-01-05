@@ -33,6 +33,17 @@ namespace fs = std::filesystem;
 namespace {
 
 volatile std::sig_atomic_t g_should_stop = 0;
+std::ofstream g_log_stream;
+
+std::string log_timestamp() {
+    auto now = std::chrono::system_clock::now();
+    std::time_t t = std::chrono::system_clock::to_time_t(now);
+    std::tm tm {};
+    localtime_r(&t, &tm);
+    std::ostringstream oss;
+    oss << std::put_time(&tm, "%Y-%m-%d %H:%M:%S");
+    return oss.str();
+}
 
 void handle_signal(int) { g_should_stop = 1; }
 
@@ -92,7 +103,28 @@ std::string pbkdf2_sha256_hex(const std::string& password, const std::string& sa
 }
 
 void log(const std::string& level, const std::string& msg) {
-    std::cerr << "[" << level << "] " << msg << std::endl;
+    std::string line = log_timestamp() + " [" + level + "] " + msg;
+    std::cerr << line << std::endl;
+    if (g_log_stream.is_open()) {
+        g_log_stream << line << std::endl;
+    }
+}
+
+void configure_logging(const fs::path& logfile) {
+    if (logfile.empty()) return;
+    if (g_log_stream.is_open()) {
+        g_log_stream.close();
+    }
+    std::error_code ec;
+    if (!logfile.parent_path().empty()) {
+        fs::create_directories(logfile.parent_path(), ec);
+    }
+    g_log_stream.open(logfile, std::ios::app);
+    if (!g_log_stream.is_open()) {
+        std::cerr << "[WARN] Failed to open log file " << logfile << ": " << std::strerror(errno) << std::endl;
+    } else {
+        g_log_stream << log_timestamp() << " [INFO] Logging initialized" << std::endl;
+    }
 }
 
 struct Config {
@@ -100,12 +132,18 @@ struct Config {
     std::string ota_password;
     std::string bind_address = "0.0.0.0";
     fs::path running_path = "./host_firmware";
+    std::string running_filename;
     fs::path backup_path = "./backups";
     fs::path temp_path = "./tmp";
     std::size_t backup_keep = 10;
     bool run_in_background = false;
     bool exit_after_exec = false;
-    fs::path pid_file() const { return running_path.string() + ".pid"; }
+    int watchdog_interval_seconds = 30;
+    fs::path log_path = "/var/log/esphome_hostota.log";
+    fs::path target_path() const {
+        return running_filename.empty() ? running_path : running_path / running_filename;
+    }
+    fs::path pid_file() const { return target_path().string() + ".pid"; }
 };
 
 std::optional<std::string> read_file(const fs::path& path) {
@@ -145,6 +183,39 @@ std::optional<fs::path> find_config(const std::optional<fs::path>& override_path
 void ensure_directories(const Config& cfg) {
     fs::create_directories(cfg.backup_path);
     fs::create_directories(cfg.temp_path);
+    if (!cfg.target_path().parent_path().empty()) {
+        fs::create_directories(cfg.target_path().parent_path());
+    }
+}
+
+std::optional<pid_t> read_pid_file(const fs::path& pid_path) {
+    if (!fs::exists(pid_path)) return std::nullopt;
+    std::ifstream in(pid_path);
+    pid_t pid;
+    if (in >> pid) {
+        return pid;
+    }
+    return std::nullopt;
+}
+
+std::optional<pid_t> find_pid_by_exe(const fs::path& target) {
+    if (target.empty()) return std::nullopt;
+    std::error_code ec;
+    fs::path canonical_target = fs::weakly_canonical(target, ec);
+    if (ec) canonical_target = target;
+    for (const auto& entry : fs::directory_iterator("/proc")) {
+        if (!entry.is_directory()) continue;
+        const std::string name = entry.path().filename().string();
+        if (!std::all_of(name.begin(), name.end(), ::isdigit)) continue;
+        pid_t pid = static_cast<pid_t>(std::stoi(name));
+        if (pid == getpid()) continue;
+        fs::path exe = fs::read_symlink(entry.path() / "exe", ec);
+        if (ec) continue;
+        if (fs::equivalent(exe, canonical_target, ec) || (!ec && exe == canonical_target)) {
+            return pid;
+        }
+    }
+    return std::nullopt;
 }
 
 bool parse_bool(const std::string& value) {
@@ -185,6 +256,9 @@ Config load_config(const std::optional<fs::path>& override_path, bool& used_defa
         else if (key == "backup_keep") cfg.backup_keep = static_cast<std::size_t>(std::stoul(val));
         else if (key == "run_in_background") cfg.run_in_background = parse_bool(val);
         else if (key == "exit_after_exec") cfg.exit_after_exec = parse_bool(val);
+        else if (key == "running_filename") cfg.running_filename = val;
+        else if (key == "watchdog_interval_seconds") cfg.watchdog_interval_seconds = std::stoi(val);
+        else if (key == "log_path") cfg.log_path = val;
     }
     log("INFO", "Loaded config from " + maybe->string());
     return cfg;
@@ -219,13 +293,9 @@ void trim_backups(const Config& cfg) {
 
 bool kill_existing_process(const Config& cfg) {
     fs::path pid_path = cfg.pid_file();
-    if (!fs::exists(pid_path)) return true;
-    std::ifstream in(pid_path);
-    pid_t pid;
-    if (!(in >> pid)) {
-        log("WARN", "Could not read PID file, skipping process termination.");
-        return true;
-    }
+    auto pid_opt = read_pid_file(pid_path);
+    if (!pid_opt) return true;
+    pid_t pid = *pid_opt;
     if (pid <= 0) return true;
     log("INFO", "Attempting to terminate existing process PID " + std::to_string(pid));
     if (kill(pid, SIGTERM) != 0 && errno != ESRCH) {
@@ -245,11 +315,12 @@ bool kill_existing_process(const Config& cfg) {
 }
 
 bool move_to_backup(const Config& cfg) {
-    if (!fs::exists(cfg.running_path)) return true;
+    fs::path current = cfg.target_path();
+    if (!fs::exists(current)) return true;
     ensure_directories(cfg);
     fs::path backup_target = cfg.backup_path / ("bak_" + now_string());
     std::error_code ec;
-    fs::rename(cfg.running_path, backup_target, ec);
+    fs::rename(current, backup_target, ec);
     if (ec) {
         log("ERROR", "Failed to move existing binary to backup: " + ec.message());
         return false;
@@ -268,12 +339,12 @@ bool promote_new_binary(const Config& cfg, const fs::path& temp_file) {
     if (ec) {
         log("WARN", "Failed to set executable permissions: " + ec.message());
     }
-    fs::rename(temp_file, cfg.running_path, ec);
+    fs::rename(temp_file, cfg.target_path(), ec);
     if (ec) {
         log("ERROR", "Failed to move new binary to running location: " + ec.message());
         return false;
     }
-    log("INFO", "New binary moved to " + cfg.running_path.string());
+    log("INFO", "New binary moved to " + cfg.target_path().string());
     return true;
 }
 
@@ -296,7 +367,8 @@ bool launch_binary(const Config& cfg) {
                 if (fd > 2) close(fd);
             }
         }
-        execl(cfg.running_path.c_str(), cfg.running_path.c_str(), static_cast<char*>(nullptr));
+        fs::path binary_path = cfg.target_path();
+        execl(binary_path.c_str(), binary_path.c_str(), static_cast<char*>(nullptr));
         _exit(1);
     }
     std::ofstream out(cfg.pid_file());
@@ -322,6 +394,7 @@ class OtaServer {
 public:
     explicit OtaServer(Config cfg) : cfg_(std::move(cfg)) {
         password_hash_ = cfg_.ota_password.empty() ? "" : sha256_hex(cfg_.ota_password);
+        last_watchdog_check_ = std::chrono::steady_clock::now();
     }
 
     bool start() {
@@ -354,10 +427,10 @@ public:
                 log("ERROR", "select failed: " + std::string(std::strerror(errno)));
                 break;
             }
-            if (ret == 0) continue;
             if (FD_ISSET(udp_fd_, &rfds)) {
                 handle_udp();
             }
+            run_watchdog();
         }
     }
 
@@ -369,6 +442,8 @@ private:
     Invitation invitation_;
     sockaddr_in last_remote_ {};
     int udp_fd_ = -1;
+    bool update_in_progress_ = false;
+    std::chrono::steady_clock::time_point last_watchdog_check_ {};
 
     void handle_udp() {
         char buffer[256];
@@ -429,6 +504,11 @@ private:
     }
 
     void process_update(const sockaddr_in& remote) {
+        struct FlagGuard {
+            bool& flag;
+            explicit FlagGuard(bool& f) : flag(f) { flag = true; }
+            ~FlagGuard() { flag = false; }
+        } guard(update_in_progress_);
         std::string host_ip = inet_ntoa(remote.sin_addr);
         log("INFO", "Starting update from " + host_ip + ":" + std::to_string(invitation_.host_port));
         ensure_directories(cfg_);
@@ -509,6 +589,59 @@ private:
             std::raise(SIGTERM);
         }
     }
+
+    bool binary_running() {
+        fs::path pid_path = cfg_.pid_file();
+        auto pid_opt = read_pid_file(pid_path);
+        if (pid_opt && *pid_opt > 0) {
+            if (kill(*pid_opt, 0) == 0) return true;
+            if (errno != ESRCH) {
+                log("WARN", "Unable to query process state for PID " + std::to_string(*pid_opt) + ": " +
+                                 std::strerror(errno));
+            }
+        }
+
+        auto by_exe = find_pid_by_exe(cfg_.target_path());
+        if (by_exe && *by_exe > 0) {
+            std::ofstream out(pid_path);
+            if (out) {
+                out << *by_exe;
+                log("INFO", "Watchdog found running process for target, refreshed PID file with " +
+                                  std::to_string(*by_exe));
+            }
+            return true;
+        }
+        return false;
+    }
+
+    void run_watchdog() {
+        if (cfg_.watchdog_interval_seconds <= 0) return;
+        auto now = std::chrono::steady_clock::now();
+        if (std::chrono::duration_cast<std::chrono::seconds>(now - last_watchdog_check_).count() <
+            cfg_.watchdog_interval_seconds) {
+            return;
+        }
+        last_watchdog_check_ = now;
+        if (update_in_progress_) {
+            log("INFO", "Watchdog skipped while update in progress");
+            return;
+        }
+        if (binary_running()) {
+            return;
+        }
+        if (!fs::exists(cfg_.target_path())) {
+            log("WARN", "Watchdog could not find binary at " + cfg_.target_path().string());
+            return;
+        }
+        log("WARN", "Watchdog restarting missing binary");
+        if (!kill_existing_process(cfg_)) {
+            log("ERROR", "Watchdog failed to clean up previous process");
+            return;
+        }
+        if (!launch_binary(cfg_)) {
+            log("ERROR", "Watchdog failed to launch binary");
+        }
+    }
 };
 
 void print_help() {
@@ -543,6 +676,8 @@ int main(int argc, char* argv[]) {
     if (used_defaults) {
         log("WARN", "Create a config file similar to config.example.conf to override defaults.");
     }
+
+    configure_logging(cfg.log_path);
 
     if (cfg.run_in_background && !force_foreground) {
         if (daemon(0, 0) != 0) {
