@@ -63,6 +63,12 @@ Options:
 - `--foreground`: Force foreground mode even if `run_in_background=true` in the config.
 - `-h` / `--help`: Show a short help message.
 
+### Additional configuration
+
+- `running_filename`: When `running_path` points to a directory, override the filename for the incoming binary (the file pushed by OTA will be renamed to this).
+- `watchdog_interval_seconds`: Periodic interval (in seconds) for the watchdog to check the configured binary. Set to `0` or negative to disable. Default: `30`.
+- `log_path`: Path for the application log file. Defaults to `/var/log/esphome_hostota.log`. The server writes human-readable timestamps and log levels to both stderr and this file when configured.
+
 The process will:
 1. Listen on the configured OTA port (default `3232`) and respond to ESPHome/`espota.py` invitations.
 2. If a password is set, issue an `AUTH <nonce>` challenge; otherwise respond with `OK`.
